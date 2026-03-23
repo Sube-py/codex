@@ -3,6 +3,7 @@ use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::Context;
 use codex_core::AuthManager;
 use codex_core::NewThread;
 use codex_core::ThreadManager;
@@ -509,7 +510,7 @@ async fn codex_reply_resumes_vscode_thread_from_rollout() -> anyhow::Result<()> 
     let rollout_path = session_configured
         .rollout_path
         .as_ref()
-        .expect("resumed test thread should persist rollout");
+        .context("resumed test thread should persist rollout")?;
     let session_meta = read_session_meta_line(rollout_path).await?;
     assert_eq!(session_meta.meta.source, SessionSource::VSCode);
 
