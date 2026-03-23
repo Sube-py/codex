@@ -127,6 +127,7 @@ pub async fn run_main(
         let mut processor = MessageProcessor::new(
             outgoing_message_sender,
             arg0_paths,
+            cli_config_overrides,
             std::sync::Arc::new(config),
         );
         async move {

@@ -104,6 +104,8 @@ Clients should render events and, when present, surface approval requests (see n
 
 The `codex` and `codex-reply` tools return standard MCP `CallToolResult` payloads. For compatibility with MCP clients that prefer `structuredContent`, Codex mirrors the content blocks inside `structuredContent` alongside the `threadId`.
 
+`codex-reply` first targets a currently loaded in-memory thread. If that thread is not loaded but a rollout with the same `threadId` exists under the current `CODEX_HOME`, the MCP server resumes the stored thread and continues it. This allows MCP clients to continue threads originally created by other Codex clients that share the same `CODEX_HOME`.
+
 Example:
 
 ```json

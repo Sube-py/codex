@@ -2,15 +2,19 @@ use std::collections::HashMap;
 
 use codex_arg0::Arg0DispatchPaths;
 use codex_core::AuthManager;
+use codex_core::RolloutRecorder;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
+use codex_core::config::ConfigOverrides;
 use codex_core::default_client::USER_AGENT_SUFFIX;
 use codex_core::default_client::get_codex_user_agent;
+use codex_core::find_thread_path_by_id_str;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::Submission;
+use codex_utils_cli::CliConfigOverrides;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
 use rmcp::model::ClientNotification;
@@ -41,6 +45,8 @@ pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     initialized: bool,
     arg0_paths: Arg0DispatchPaths,
+    cli_config_overrides: CliConfigOverrides,
+    config: Arc<Config>,
     thread_manager: Arc<ThreadManager>,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
 }
@@ -51,6 +57,7 @@ impl MessageProcessor {
     pub(crate) fn new(
         outgoing: OutgoingMessageSender,
         arg0_paths: Arg0DispatchPaths,
+        cli_config_overrides: CliConfigOverrides,
         config: Arc<Config>,
     ) -> Self {
         let outgoing = Arc::new(outgoing);
@@ -73,6 +80,8 @@ impl MessageProcessor {
             outgoing,
             initialized: false,
             arg0_paths,
+            cli_config_overrides,
+            config,
             thread_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -485,17 +494,134 @@ impl MessageProcessor {
         let outgoing = self.outgoing.clone();
         let running_requests_id_to_codex_uuid = self.running_requests_id_to_codex_uuid.clone();
 
-        let codex = match self.thread_manager.get_thread(thread_id).await {
-            Ok(c) => c,
+        let (thread_id, codex) = match self.thread_manager.get_thread(thread_id).await {
+            Ok(codex) => (thread_id, codex),
             Err(_) => {
-                tracing::warn!("Session not found for thread_id: {thread_id}");
-                let result = crate::codex_tool_runner::create_call_tool_result_with_thread_id(
-                    thread_id,
-                    format!("Session not found for thread_id: {thread_id}"),
-                    Some(true),
-                );
-                outgoing.send_response(request_id, result).await;
-                return;
+                tracing::info!("thread_id {thread_id} not loaded; attempting rollout resume");
+
+                let rollout_path = match find_thread_path_by_id_str(
+                    self.config.codex_home.as_path(),
+                    &thread_id.to_string(),
+                )
+                .await
+                {
+                    Ok(Some(path)) => path,
+                    Ok(None) => {
+                        tracing::warn!("Session not found for thread_id: {thread_id}");
+                        let result =
+                            crate::codex_tool_runner::create_call_tool_result_with_thread_id(
+                                thread_id,
+                                format!("Session not found for thread_id: {thread_id}"),
+                                Some(true),
+                            );
+                        outgoing.send_response(request_id, result).await;
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to locate rollout for thread_id {thread_id}: {err}"
+                        );
+                        let result =
+                            crate::codex_tool_runner::create_call_tool_result_with_thread_id(
+                                thread_id,
+                                format!(
+                                    "Failed to locate rollout for thread_id {thread_id}: {err}"
+                                ),
+                                Some(true),
+                            );
+                        outgoing.send_response(request_id, result).await;
+                        return;
+                    }
+                };
+
+                let history = match RolloutRecorder::get_rollout_history(&rollout_path).await {
+                    Ok(history) => history,
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to load rollout history for thread_id {thread_id} from {}: {err}",
+                            rollout_path.display()
+                        );
+                        let result =
+                            crate::codex_tool_runner::create_call_tool_result_with_thread_id(
+                                thread_id,
+                                format!(
+                                    "Failed to load rollout history for thread_id {thread_id}: {err}"
+                                ),
+                                Some(true),
+                            );
+                        outgoing.send_response(request_id, result).await;
+                        return;
+                    }
+                };
+
+                let cli_overrides = match self.cli_config_overrides.parse_overrides() {
+                    Ok(overrides) => overrides,
+                    Err(err) => {
+                        tracing::error!("Failed to parse CLI config overrides for resume: {err}");
+                        let result =
+                            crate::codex_tool_runner::create_call_tool_result_with_thread_id(
+                                thread_id,
+                                format!("Failed to parse CLI config overrides for resume: {err}"),
+                                Some(true),
+                            );
+                        outgoing.send_response(request_id, result).await;
+                        return;
+                    }
+                };
+
+                let config = match Config::load_with_cli_overrides_and_harness_overrides(
+                    cli_overrides,
+                    ConfigOverrides {
+                        cwd: history.session_cwd(),
+                        codex_linux_sandbox_exe: self.arg0_paths.codex_linux_sandbox_exe.clone(),
+                        main_execve_wrapper_exe: self.arg0_paths.main_execve_wrapper_exe.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                {
+                    Ok(config) => config,
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to derive config for resumed thread_id {thread_id}: {err}"
+                        );
+                        let result =
+                            crate::codex_tool_runner::create_call_tool_result_with_thread_id(
+                                thread_id,
+                                format!(
+                                    "Failed to derive config for resumed thread_id {thread_id}: {err}"
+                                ),
+                                Some(true),
+                            );
+                        outgoing.send_response(request_id, result).await;
+                        return;
+                    }
+                };
+
+                match self
+                    .thread_manager
+                    .resume_thread_with_history(
+                        config,
+                        history,
+                        self.thread_manager.auth_manager(),
+                        /*persist_extended_history*/ false,
+                        /*parent_trace*/ None,
+                    )
+                    .await
+                {
+                    Ok(new_thread) => (new_thread.thread_id, new_thread.thread),
+                    Err(err) => {
+                        tracing::error!("Failed to resume stored thread_id {thread_id}: {err}");
+                        let result =
+                            crate::codex_tool_runner::create_call_tool_result_with_thread_id(
+                                thread_id,
+                                format!("Failed to resume stored thread_id {thread_id}: {err}"),
+                                Some(true),
+                            );
+                        outgoing.send_response(request_id, result).await;
+                        return;
+                    }
+                }
             }
         };
 

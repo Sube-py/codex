@@ -219,6 +219,34 @@ impl McpProcess {
         .await
     }
 
+    /// Returns the id used to make the request so it can be correlated with
+    /// the matching response.
+    pub async fn send_codex_reply_tool_call(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+    ) -> anyhow::Result<i64> {
+        let codex_tool_call_params = CallToolRequestParams {
+            meta: None,
+            name: "codex-reply".into(),
+            arguments: Some(
+                json!({
+                    "threadId": thread_id,
+                    "prompt": prompt,
+                })
+                .as_object()
+                .cloned()
+                .expect("codex-reply params serialize to object"),
+            ),
+            task: None,
+        };
+        self.send_request(
+            "tools/call",
+            Some(serde_json::to_value(codex_tool_call_params)?),
+        )
+        .await
+    }
+
     async fn send_request(
         &mut self,
         method: &str,

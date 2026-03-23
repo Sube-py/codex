@@ -3,14 +3,25 @@ use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 
+use codex_core::AuthManager;
+use codex_core::NewThread;
+use codex_core::ThreadManager;
+use codex_core::config::ConfigBuilder;
+use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
+use codex_core::read_session_meta_line;
 use codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR;
+use codex_features::Feature;
 use codex_mcp_server::CodexToolCallParam;
 use codex_mcp_server::ExecApprovalElicitRequestParams;
 use codex_mcp_server::ExecApprovalResponse;
 use codex_mcp_server::PatchApprovalElicitRequestParams;
 use codex_mcp_server::PatchApprovalResponse;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileChange;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::user_input::UserInput;
 use codex_shell_command::parse_command;
 use pretty_assertions::assert_eq;
 use rmcp::model::JsonRpcResponse;
@@ -22,6 +33,7 @@ use tokio::time::timeout;
 use wiremock::MockServer;
 
 use core_test_support::skip_if_no_network;
+use core_test_support::wait_for_event_with_timeout;
 use mcp_test_support::McpProcess;
 use mcp_test_support::create_apply_patch_sse_response;
 use mcp_test_support::create_final_assistant_message_sse_response;
@@ -428,6 +440,109 @@ async fn codex_tool_passes_base_instructions() -> anyhow::Result<()> {
     assert!(
         developer_contents.contains(&"Foreshadow upcoming tool calls."),
         "expected developer instructions in developer messages, got {developer_contents:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_codex_reply_resumes_vscode_thread_from_rollout() {
+    skip_if_no_network!();
+
+    if let Err(err) = codex_reply_resumes_vscode_thread_from_rollout().await {
+        panic!("failure: {err}");
+    }
+}
+
+async fn codex_reply_resumes_vscode_thread_from_rollout() -> anyhow::Result<()> {
+    let server = create_mock_responses_server(vec![
+        create_final_assistant_message_sse_response("Created outside MCP")?,
+        create_final_assistant_message_sse_response("Resumed through MCP reply")?,
+    ])
+    .await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await?;
+    let auth_manager = AuthManager::shared(
+        config.codex_home.clone(),
+        /*enable_codex_api_key_env*/ false,
+        config.cli_auth_credentials_store_mode,
+    );
+    let thread_manager = ThreadManager::new(
+        &config,
+        auth_manager,
+        SessionSource::VSCode,
+        CollaborationModesConfig {
+            default_mode_request_user_input: config
+                .features
+                .enabled(Feature::DefaultModeRequestUserInput),
+        },
+    );
+    let NewThread {
+        thread_id,
+        thread,
+        session_configured,
+    } = thread_manager.start_thread(config).await?;
+
+    thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Create a VS Code session".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    let _ = wait_for_event_with_timeout(
+        &thread,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        DEFAULT_READ_TIMEOUT,
+    )
+    .await;
+    thread.shutdown_and_wait().await?;
+
+    let rollout_path = session_configured
+        .rollout_path
+        .as_ref()
+        .expect("resumed test thread should persist rollout");
+    let session_meta = read_session_meta_line(rollout_path).await?;
+    assert_eq!(session_meta.meta.source, SessionSource::VSCode);
+
+    let mut mcp_process = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp_process.initialize()).await??;
+
+    let codex_request_id = mcp_process
+        .send_codex_reply_tool_call(&thread_id.to_string(), "Continue this thread via MCP")
+        .await?;
+
+    let codex_response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp_process.read_stream_until_response_message(RequestId::Number(codex_request_id)),
+    )
+    .await??;
+    assert_eq!(
+        codex_response,
+        JsonRpcResponse {
+            jsonrpc: JsonRpcVersion2_0,
+            id: RequestId::Number(codex_request_id),
+            result: json!({
+                "content": [
+                    {
+                        "text": "Resumed through MCP reply",
+                        "type": "text"
+                    }
+                ],
+                "structuredContent": {
+                    "threadId": thread_id,
+                    "content": "Resumed through MCP reply"
+                }
+            }),
+        }
     );
 
     Ok(())
